@@ -11,7 +11,7 @@ def load_image(file_path):
     with rasterio.open(file_path) as src:
         image = src.read([1, 2, 3, 4])  
         meta = src.meta
-    return np.transpose(image, (1, 2, 0)), meta 
+    return np.transpose(image, (1, 2, 0)), meta  
 
 def normalize_image(image):
     norm_image = np.zeros_like(image, dtype=np.float32)
@@ -20,19 +20,25 @@ def normalize_image(image):
         norm_image[:, :, i] = cv2.normalize(channel, None, 0, 255, cv2.NORM_MINMAX)
     return norm_image
 
-def extract_features(image):
+def extract_features(image, nfeatures=5000):
     gray = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    orb = cv2.ORB_create()
+    orb = cv2.ORB_create(nfeatures=nfeatures)
     keypoints, descriptors = orb.detectAndCompute(gray, None)
     return keypoints, descriptors
 
 def match_features(desc1, desc2):
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(desc1, desc2)
-    matches = sorted(matches, key=lambda x: x.distance)
-    return matches
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    matches = bf.knnMatch(desc1, desc2, k=2)
+    # Apply Lowe's ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good_matches.append(m)
+    return good_matches
 
 def estimate_transformation(kp1, kp2, matches):
+    if len(matches) < 4:
+        return None, None
     src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
     dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
     M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
@@ -97,8 +103,9 @@ def generate_output(scene_path, corners, corrected_pixels, corrected_image, outp
         for dp in corrected_pixels:
             f.write(f"{dp[0]}; {dp[1]}; {dp[2]}; {dp[3]}; {dp[4]}\n")
     
-   
+
     corrected_image = corrected_image.astype(np.float32)
+
 
     with rasterio.open(scene_path) as src:
         profile = src.profile
@@ -126,21 +133,24 @@ def process_scene(scene_path, sentinel_files, output_dir):
             continue
 
         M, mask = estimate_transformation(kp_scene, kp_sentinel, matches)
+        if M is None:
+            print(f"Failed to compute homography for {os.path.basename(scene_path)} and {os.path.basename(sentinel_path)}. Skipping this pair.")
+            continue
 
         warped_scene = warp_image(scene_norm, M, sentinel_norm.shape)
 
-        
+       
         transform = sentinel_meta['transform']
         corners = calculate_corners(M, transform)
 
-       
+    
         corrected_image = correct_dead_pixels(scene)
         corrected_pixels = detect_and_log_dead_pixels(scene, corrected_image)
 
-       
+        
         generate_output(scene_path, corners, corrected_pixels, corrected_image, output_dir)
 
-
+       
         plt.figure(figsize=(12, 6))
         
         plt.subplot(1, 3, 1)
@@ -172,9 +182,6 @@ def main(scene_folder, sentinel_folder, output_dir):
 if __name__ == '__main__':
     scene_folder = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\1_20'
     sentinel_folder = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\layouts'
-    output_dir = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\Output'
-    
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
+    output_dir = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\output'
+    os.makedirs(output_dir, exist_ok=True)
     main(scene_folder, sentinel_folder, output_dir)
