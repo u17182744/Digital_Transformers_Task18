@@ -2,14 +2,15 @@ import os
 import numpy as np
 import cv2
 import rasterio
-from matplotlib import pyplot as plt
 from rasterio.transform import Affine
 from rasterio.enums import Resampling
-from concurrent.futures import ThreadPoolExecutor
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def load_image(file_path):
     with rasterio.open(file_path) as src:
-        image = src.read([1, 2, 3, 4])  
+        image = src.read([1, 2, 3, 4]) 
         meta = src.meta
     return np.transpose(image, (1, 2, 0)), meta  
 
@@ -20,16 +21,23 @@ def normalize_image(image):
         norm_image[:, :, i] = cv2.normalize(channel, None, 0, 255, cv2.NORM_MINMAX)
     return norm_image
 
-def extract_features(image, nfeatures=5000):
+def extract_features(image, method='ORB', nfeatures=1000):
     gray = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    orb = cv2.ORB_create(nfeatures=nfeatures)
-    keypoints, descriptors = orb.detectAndCompute(gray, None)
+    
+    if method == 'ORB':
+        detector = cv2.ORB_create(nfeatures=nfeatures)
+    elif method == 'SIFT':
+        detector = cv2.SIFT_create(nfeatures=nfeatures)
+    elif method == 'SURF':
+        detector = cv2.xfeatures2d.SURF_create(hessianThreshold=nfeatures)
+    
+    keypoints, descriptors = detector.detectAndCompute(gray, None)
     return keypoints, descriptors
 
 def match_features(desc1, desc2):
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     matches = bf.knnMatch(desc1, desc2, k=2)
-    # Apply Lowe's ratio test
+  
     good_matches = []
     for m, n in matches:
         if m.distance < 0.75 * n.distance:
@@ -103,10 +111,10 @@ def generate_output(scene_path, corners, corrected_pixels, corrected_image, outp
         for dp in corrected_pixels:
             f.write(f"{dp[0]}; {dp[1]}; {dp[2]}; {dp[3]}; {dp[4]}\n")
     
-
+ 
     corrected_image = corrected_image.astype(np.float32)
 
-
+ 
     with rasterio.open(scene_path) as src:
         profile = src.profile
         profile.update(dtype=rasterio.float32, count=4)
@@ -114,74 +122,60 @@ def generate_output(scene_path, corners, corrected_pixels, corrected_image, outp
             dst.write(corrected_image.transpose(2, 0, 1))
 
 def process_scene(scene_path, sentinel_files, output_dir):
-    scene, scene_meta = load_image(scene_path)
-    scene_norm = normalize_image(scene)
+    try:
+        logging.info(f"Processing scene file: {scene_path}")
+        scene, scene_meta = load_image(scene_path)
+        scene_norm = normalize_image(scene)
+        
+        for sentinel_path in sentinel_files:
+            logging.info(f"Processing sentinel file: {sentinel_path}")
+            sentinel, sentinel_meta = load_image(sentinel_path)
+            sentinel_norm = normalize_image(sentinel)
+
+            scene_resized = cv2.resize(scene_norm, (sentinel_norm.shape[1], sentinel_norm.shape[0]))
+
+         
+            kp_scene, desc_scene = extract_features(scene_resized, method='SIFT', nfeatures=1000)
+            kp_sentinel, desc_sentinel = extract_features(sentinel_norm, method='SIFT', nfeatures=1000)
+
+            matches = match_features(desc_scene, desc_sentinel)
+
+            if len(matches) < 4:
+                logging.warning(f"Not enough matches found with SIFT between {os.path.basename(scene_path)} and {os.path.basename(sentinel_path)}. Skipping this pair.")
+                continue
+
+            M, mask = estimate_transformation(kp_scene, kp_sentinel, matches)
+            if M is None:
+                logging.warning(f"Failed to compute homography for {os.path.basename(scene_path)} and {os.path.basename(sentinel_path)}. Skipping this pair.")
+                continue
+
+            warped_scene = warp_image(scene_norm, M, sentinel_norm.shape)
+
+      
+            transform = sentinel_meta['transform']
+            corners = calculate_corners(M, transform)
+
+
+            corrected_image = correct_dead_pixels(scene)
+            corrected_pixels = detect_and_log_dead_pixels(scene, corrected_image)
+
+            generate_output(scene_path, corners, corrected_pixels, corrected_image, output_dir)
+
+            logging.info(f"Finished processing scene file: {scene_path} with sentinel file: {sentinel_path}")
     
-    for sentinel_path in sentinel_files:
-        sentinel, sentinel_meta = load_image(sentinel_path)
-        sentinel_norm = normalize_image(sentinel)
-
-        scene_resized = cv2.resize(scene_norm, (sentinel_norm.shape[1], sentinel_norm.shape[0]))
-
-        kp_scene, desc_scene = extract_features(scene_resized)
-        kp_sentinel, desc_sentinel = extract_features(sentinel_norm)
-
-        matches = match_features(desc_scene, desc_sentinel)
-
-        if len(matches) < 4:
-            print(f"Not enough matches found to compute homography between {os.path.basename(scene_path)} and {os.path.basename(sentinel_path)}. Skipping this pair.")
-            continue
-
-        M, mask = estimate_transformation(kp_scene, kp_sentinel, matches)
-        if M is None:
-            print(f"Failed to compute homography for {os.path.basename(scene_path)} and {os.path.basename(sentinel_path)}. Skipping this pair.")
-            continue
-
-        warped_scene = warp_image(scene_norm, M, sentinel_norm.shape)
-
-       
-        transform = sentinel_meta['transform']
-        corners = calculate_corners(M, transform)
-
-    
-        corrected_image = correct_dead_pixels(scene)
-        corrected_pixels = detect_and_log_dead_pixels(scene, corrected_image)
-
-        
-        generate_output(scene_path, corners, corrected_pixels, corrected_image, output_dir)
-
-       
-        plt.figure(figsize=(12, 6))
-        
-        plt.subplot(1, 3, 1)
-        plt.title("Original Scene")
-        plt.imshow(scene_norm[:, :, :3].astype(np.uint8))
-        
-        plt.subplot(1, 3, 2)
-        plt.title("Original Sentinel")
-        plt.imshow(sentinel_norm[:, :, :3].astype(np.uint8))
-        
-        plt.subplot(1, 3, 3)
-        plt.title("Warped Scene")
-        plt.imshow(warped_scene[:, :, :3].astype(np.uint8))
-        
-        plt.tight_layout()
-        plt.show()
+    except Exception as e:
+        logging.error(f"Error processing {scene_path}: {e}")
 
 def main(scene_folder, sentinel_folder, output_dir):
-    if not os.path.isdir(scene_folder) or not os.path.isdir(sentinel_folder):
-        raise ValueError("Invalid directory paths provided.")
-    
     scene_files = sorted([os.path.join(scene_folder, f) for f in os.listdir(scene_folder) if f.endswith(('.tif', '.tiff'))])
     sentinel_files = sorted([os.path.join(sentinel_folder, f) for f in os.listdir(sentinel_folder) if f.endswith(('.tif', '.tiff'))])
-    
-    with ThreadPoolExecutor() as executor:
-        for scene_path in scene_files:
-            executor.submit(process_scene, scene_path, sentinel_files, output_dir)
 
-if __name__ == '__main__':
-    scene_folder = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\1_20'
-    sentinel_folder = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\layouts'
-    output_dir = r'C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\output'
-    os.makedirs(output_dir, exist_ok=True)
+    for scene_path in scene_files:
+        process_scene(scene_path, sentinel_files, output_dir)
+
+if __name__ == "__main__":
+    scene_folder = r"C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\1_20"
+    sentinel_folder = r"C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\layouts"
+    output_dir = r"C:\Users\Isaac.Choma\Russian Hackathon\Russian Hackathon\output"
+
     main(scene_folder, sentinel_folder, output_dir)
